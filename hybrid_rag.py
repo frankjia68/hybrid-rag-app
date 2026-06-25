@@ -23,6 +23,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# An embedding function is an async function that:
+# 1. takes a text string
+# 2. returns a list of floating-point numbers after awaiting it
 EmbeddingFunction = Callable[[str], Awaitable[list[float]]]
 
 
@@ -52,7 +55,9 @@ class HybridRAGApplication:
         logger.info("Hybrid RAG application initialized successfully")
 
     async def _create_search_provider(self) -> AzureAISearchContextProvider:
-        """Create Azure AI Search context provider in semantic/hybrid mode."""
+        """Create the Azure AI Search provider used for retrieval."""
+        # If vector search is configured, build the async embedding helper.
+        # Otherwise this stays `None`, which means "no vector embeddings".
         embedding_function = self._create_embedding_function()
 
         return AzureAISearchContextProvider(
@@ -69,48 +74,72 @@ class HybridRAGApplication:
         )
 
     def _create_embedding_function(self) -> EmbeddingFunction | None:
-        """Create an Azure OpenAI embedding function for vector hybrid search."""
+        """Create the function that turns text into an embedding vector.
+
+        If the app is not configured for vector search, return None instead.
+        """
         if not self.config.vector_field_name:
             return None
 
-        endpoint = (
-            self.config.azure_openai_endpoint
-            or self.config.azure_openai_resource_url
-        )
+        endpoint = self._get_embedding_endpoint()
         deployment = self.config.azure_openai_embedding_deployment
         if not endpoint or not deployment:
             return None
 
-        endpoint = endpoint.rstrip("/")
-        api_version = "2024-02-01"
-        url = (
-            f"{endpoint}/openai/deployments/{deployment}/embeddings"
-            f"?api-version={api_version}"
-        )
+        url = self._build_embedding_url(endpoint, deployment)
 
         async def embed(text: str) -> list[float]:
-            headers = {"Content-Type": "application/json"}
-            if self.config.azure_openai_api_key:
-                headers["api-key"] = self.config.azure_openai_api_key
-            elif self.credential:
-                token = await self.credential.get_token(
-                    "https://cognitiveservices.azure.com/.default"
-                )
-                headers["Authorization"] = f"Bearer {token.token}"
-
-            payload = {
-                "input": text,
-                "model": self.config.azure_openai_embedding_model or deployment,
-            }
+            headers = await self._build_embedding_headers()
+            payload = self._build_embedding_payload(text, deployment)
 
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload, headers=headers) as resp:
                     resp.raise_for_status()
                     data = await resp.json()
 
-            return data["data"][0]["embedding"]
+            return self._extract_embedding(data)
 
         return embed
+
+    def _get_embedding_endpoint(self) -> str | None:
+        """Return whichever Azure OpenAI endpoint setting the config provides."""
+        return self.config.azure_openai_endpoint or self.config.azure_openai_resource_url
+
+    def _build_embedding_url(self, endpoint: str, deployment: str) -> str:
+        """Build the Azure OpenAI embeddings URL for the configured deployment."""
+        endpoint = endpoint.rstrip("/")
+        api_version = "2024-02-01"
+        return (
+            f"{endpoint}/openai/deployments/{deployment}/embeddings"
+            f"?api-version={api_version}"
+        )
+
+    async def _build_embedding_headers(self) -> dict[str, str]:
+        """Build the headers needed to call Azure OpenAI embeddings."""
+        headers = {"Content-Type": "application/json"}
+
+        if self.config.azure_openai_api_key:
+            headers["api-key"] = self.config.azure_openai_api_key
+            return headers
+
+        if self.credential:
+            token = await self.credential.get_token(
+                "https://cognitiveservices.azure.com/.default"
+            )
+            headers["Authorization"] = f"Bearer {token.token}"
+
+        return headers
+
+    def _build_embedding_payload(self, text: str, deployment: str) -> dict[str, str]:
+        """Build the request body sent to the embeddings endpoint."""
+        return {
+            "input": text,
+            "model": self.config.azure_openai_embedding_model or deployment,
+        }
+
+    def _extract_embedding(self, response_data: dict) -> list[float]:
+        """Pull the first embedding vector out of the Azure OpenAI response."""
+        return response_data["data"][0]["embedding"]
 
     def _create_agent(self) -> Agent:
         """Create the Hybrid RAG agent."""
